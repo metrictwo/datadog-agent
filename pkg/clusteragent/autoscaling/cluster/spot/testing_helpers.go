@@ -13,6 +13,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/record"
 
 	workloadmeta "github.com/DataDog/datadog-agent/comp/core/workloadmeta/def"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/sender"
@@ -33,7 +34,8 @@ func NewTestScheduler(config Config, s sender.Sender, wlm workloadmeta.Component
 		return nil
 	})
 	tel := newTelemetry(s, isLeader, testGlobalTagsFunc)
-	return newScheduler(config, wlm, evictorFunc, patcherFunc, dynamicClient, newWLMPodLister(wlm), isLeader, tel)
+	events := newSpotEventRecorder(record.NewFakeRecorder(100))
+	return newScheduler(config, wlm, evictorFunc, patcherFunc, dynamicClient, newWLMPodLister(wlm), isLeader, tel, events)
 }
 
 // HasAdmissionsOrPending reports whether the pod tracker has any in-flight admissions or pending pods
