@@ -37,6 +37,7 @@ import (
 	telemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/def"
 	mocktelemetry "github.com/DataDog/datadog-agent/comp/core/telemetry/mock"
 	"github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder"
+	defaultforwarderimpl "github.com/DataDog/datadog-agent/comp/forwarder/defaultforwarder/impl"
 	metricscompression "github.com/DataDog/datadog-agent/comp/serializer/metricscompression/def"
 	metricscompressionfx "github.com/DataDog/datadog-agent/comp/serializer/metricscompression/fx-otel"
 	configmock "github.com/DataDog/datadog-agent/pkg/config/mock"
@@ -1022,7 +1023,7 @@ func TestDefaultForwarder_SwallowsErrors(t *testing.T) {
 // via a mini-Fx app. This simulates the DDOT production path where
 // cmd/otel-agent/subcommands/run/command.go injects OTelSyncForwarder into the
 // shared serializer (OTAGENT-1024). Not for use outside of tests.
-func initSyncSerializerForTest(t testing.TB, logger *zap.Logger, cfg *ExporterConfig, sourceProvider source.Provider, httpClient *http.Client) (*serializer.Serializer, *defaultforwarder.OTelSyncForwarder, error) {
+func initSyncSerializerForTest(t testing.TB, logger *zap.Logger, cfg *ExporterConfig, sourceProvider source.Provider, httpClient *http.Client) (*serializer.Serializer, *defaultforwarderimpl.OTelSyncForwarder, error) {
 	var f defaultforwarder.Forwarder
 	var s *serializer.Serializer
 
@@ -1071,7 +1072,7 @@ func initSyncSerializerForTest(t testing.TB, logger *zap.Logger, cfg *ExporterCo
 			if err != nil {
 				return nil, err
 			}
-			return defaultforwarder.NewOTelSyncForwarder(c, l, sec, eds, httpClient)
+			return defaultforwarderimpl.NewOTelSyncForwarder(c, l, sec, eds, httpClient)
 		}),
 	}
 
@@ -1080,9 +1081,9 @@ func initSyncSerializerForTest(t testing.TB, logger *zap.Logger, cfg *ExporterCo
 		return nil, nil, err
 	}
 
-	sf, ok := f.(*defaultforwarder.OTelSyncForwarder)
+	sf, ok := f.(*defaultforwarderimpl.OTelSyncForwarder)
 	if !ok {
-		return nil, nil, errors.New("failed to cast forwarder to *defaultforwarder.OTelSyncForwarder")
+		return nil, nil, errors.New("failed to cast forwarder to *defaultforwarderimpl.OTelSyncForwarder")
 	}
 	return s, sf, nil
 }
