@@ -121,11 +121,32 @@ func setupSerializer(config pkgconfigmodel.Config, cfg *ExporterConfig) {
 	config.Set("proxy.no_proxy", noProxy, pkgconfigmodel.SourceAgentRuntime)
 }
 
-// InitSerializer initializes the serializer and forwarder for sending metrics. Should only be used in OSS Datadog exporter or in tests.
+// stoppableForwarder is the minimum surface InitSerializer's callers need to
+// drive the forwarder lifecycle.
+type stoppableForwarder interface {
+	Start() error
+	Stop()
+}
+
+// InitSerializer initializes the serializer and the DefaultForwarder behind
+// it. Should only be used in the OSS Datadog exporter or in tests.
 func InitSerializer(logger *zap.Logger, cfg *ExporterConfig, sourceProvider source.Provider) (*serializer.Serializer, *defaultforwarderimpl.DefaultForwarder, error) {
-	var f defaultforwarder.Component
+	s, fw, err := initSerializerInternal(logger, cfg, sourceProvider)
+	if err != nil {
+		return nil, nil, err
+	}
+	def, _ := fw.(*defaultforwarderimpl.DefaultForwarder)
+	return s, def, nil
+}
+
+// initSerializerInternal builds the serializer and a DefaultForwarder.
+// Used only by the OSS Datadog exporter. DDOT injects its forwarder directly
+// through the Fx graph in cmd/otel-agent/subcommands/run/command.go.
+func initSerializerInternal(logger *zap.Logger, cfg *ExporterConfig, sourceProvider source.Provider) (*serializer.Serializer, stoppableForwarder, error) {
+	var f defaultforwarder.Forwarder
 	var s *serializer.Serializer
-	app := fx.New(
+
+	opts := []fx.Option{
 		fx.WithLogger(func(log *zap.Logger) fxevent.Logger {
 			return &fxevent.ZapLogger{Logger: log}
 		}),
@@ -156,10 +177,6 @@ func InitSerializer(logger *zap.Logger, cfg *ExporterConfig, sourceProvider sour
 			zp := &datadog.Zaplogger{Logger: log}
 			return zp, nil
 		}),
-		// casts the defaultforwarder.Component to a defaultforwarder.Forwarder
-		fx.Provide(func(c defaultforwarder.Component) (defaultforwarder.Forwarder, error) {
-			return c, nil
-		}),
 		// this is the hostname argument for serializer.NewSerializer
 		// this should probably be wrapped by a type
 		fx.Provide(func() string {
@@ -176,17 +193,27 @@ func InitSerializer(logger *zap.Logger, cfg *ExporterConfig, sourceProvider sour
 			return c
 		}),
 		fx.Provide(func() secrets.Component { return &secretnooptypes.SecretNoop{} }),
-		defaultforwarderfx.Module(defaultforwarder.NewParams()),
 		delegatedauthnoopfx.Module(),
 		fx.Populate(&f),
 		fx.Populate(&s),
+	}
+
+	opts = append(opts,
+		// casts the defaultforwarder.Component to a defaultforwarder.Forwarder
+		fx.Provide(func(c defaultforwarder.Component) (defaultforwarder.Forwarder, error) {
+			return defaultforwarder.Forwarder(c), nil
+		}),
+		defaultforwarderfx.Module(defaultforwarder.NewParams()),
 	)
+
+	app := fx.New(opts...)
 	if err := app.Err(); err != nil {
 		return nil, nil, err
 	}
+
 	fw, ok := f.(*defaultforwarderimpl.DefaultForwarder)
 	if !ok {
-		return nil, nil, errors.New("failed to cast forwarder to defaultforwarderimpl.DefaultForwarder")
+		return nil, nil, errors.New("failed to cast forwarder to *defaultforwarderimpl.DefaultForwarder")
 	}
 	return s, fw, nil
 }
