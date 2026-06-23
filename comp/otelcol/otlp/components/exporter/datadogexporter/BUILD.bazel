@@ -44,6 +44,7 @@ go_library(
 go_test(
     name = "datadogexporter_test",
     srcs = [
+        "factory_test.go",
         "host_metadata_test.go",
         "traces_exporter_test.go",
     ],

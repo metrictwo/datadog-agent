@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +31,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/serializer"
 	"github.com/DataDog/datadog-agent/pkg/util/otel"
 
+	goatomic "go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -40,8 +40,8 @@ import (
 // benchmarks show parallelism — set to 0 for the fastest local loopback.
 type fakeIntake struct {
 	*httptest.Server
-	requests          atomic.Int64
-	bytes             atomic.Int64
+	requests          goatomic.Int64
+	bytes             goatomic.Int64
 	status            int
 	artificialLatency time.Duration
 }
