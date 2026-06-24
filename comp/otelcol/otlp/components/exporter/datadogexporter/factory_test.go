@@ -14,6 +14,8 @@ import (
 	datadogconfig "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/datadog/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/components/exporter/serializerexporter"
 )
 
 // TestBuildMetricsExporterConfig_HTTPPassThrough verifies that user-configured
@@ -78,22 +80,45 @@ func TestBuildMetricsExporterConfig_APIPassThrough(t *testing.T) {
 	assert.Equal(t, datadogconfig.APIConfig{Key: "secret-key", Site: "datadoghq.eu"}, ex.API)
 }
 
+// TestBuildMetricsExporterConfig_RetryDefaultsToLegacyBudget verifies that
+// when the user hasn't configured retry_on_failure, the serializer exporter
+// uses the legacy forwarder retry budget (2-64s / 15 min) rather than the
+// OTel defaults (5s / 30s / 5 min). This preserves the pre-sync-forwarder
+// behavior for DDOT deployments.
+func TestBuildMetricsExporterConfig_RetryDefaultsToLegacyBudget(t *testing.T) {
+	cfg, ok := CreateDefaultConfig().(*datadogconfig.Config)
+	require.True(t, ok)
+	// Do not modify cfg.BackOffConfig — use whatever CreateDefaultConfig sets.
+
+	ex := buildMetricsExporterConfig(cfg, nil)
+
+	legacyDefaults := serializerexporter.DefaultAgentRetryConfig()
+	assert.Equal(t, legacyDefaults.InitialInterval, ex.RetryConfig.InitialInterval,
+		"InitialInterval should default to legacy 2s, not OTel 5s")
+	assert.Equal(t, legacyDefaults.MaxInterval, ex.RetryConfig.MaxInterval,
+		"MaxInterval should default to legacy 64s, not OTel 30s")
+	assert.Equal(t, legacyDefaults.MaxElapsedTime, ex.RetryConfig.MaxElapsedTime,
+		"MaxElapsedTime should default to legacy 15 min, not OTel 5 min")
+}
+
 // TestBuildMetricsExporterConfig_RetryPassThrough verifies that the
 // retry_on_failure settings from the datadogexporter config are forwarded to
-// the serializer exporter's RetryConfig so the OTel exporterhelper retry layer
-// honours user-configured backoff intervals.
+// the serializer exporter's RetryConfig when they differ from OTel defaults,
+// so the OTel exporterhelper retry layer honours explicit user overrides.
 func TestBuildMetricsExporterConfig_RetryPassThrough(t *testing.T) {
 	cfg, ok := CreateDefaultConfig().(*datadogconfig.Config)
 	require.True(t, ok)
+	// Use values that differ from OTel defaults so they are treated as
+	// explicit user overrides rather than "not configured".
 	cfg.BackOffConfig.Enabled = true
 	cfg.BackOffConfig.InitialInterval = 3 * time.Second
 	cfg.BackOffConfig.MaxInterval = 60 * time.Second
-	cfg.BackOffConfig.MaxElapsedTime = 5 * time.Minute
+	cfg.BackOffConfig.MaxElapsedTime = 10 * time.Minute // differs from OTel default (5m)
 
 	ex := buildMetricsExporterConfig(cfg, nil)
 
 	assert.True(t, ex.RetryConfig.Enabled)
 	assert.Equal(t, 3*time.Second, ex.RetryConfig.InitialInterval)
 	assert.Equal(t, 60*time.Second, ex.RetryConfig.MaxInterval)
-	assert.Equal(t, 5*time.Minute, ex.RetryConfig.MaxElapsedTime)
+	assert.Equal(t, 10*time.Minute, ex.RetryConfig.MaxElapsedTime)
 }

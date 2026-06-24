@@ -29,6 +29,7 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
 	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes"
@@ -103,6 +104,37 @@ func newDefaultConfigForAgent() component.Config {
 	cfg.HTTPConfig.Timeout = legacyForwarderTimeout
 
 	return cfg
+}
+
+// DefaultAgentRetryConfig returns a retry configuration that mirrors the
+// legacy DefaultForwarder budget (2-64s exponential backoff over 15 min).
+// DDOT uses this as the base when the user has not customized retry_on_failure,
+// preserving the pre-sync-forwarder behavior.
+func DefaultAgentRetryConfig() configretry.BackOffConfig {
+	cfg := configretry.NewDefaultBackOffConfig()
+	cfg.InitialInterval = legacyForwarderBackoffInitial
+	cfg.Multiplier = float64(legacyForwarderBackoffMultiplier)
+	cfg.MaxInterval = legacyForwarderBackoffMax
+	cfg.MaxElapsedTime = legacyForwarderRetryMaxElapsed
+	return cfg
+}
+
+// allSendsPermanent reports whether every constituent error in err wraps
+// ErrPermanentHTTPError. consumer.Send returns a multierr-combined error
+// (series + sketches + APM stats sends); we mark the whole flush permanent
+// only when every sub-send failed with a non-retryable status code so that
+// a transient failure in one pipeline does not suppress retries for another.
+func allSendsPermanent(err error) bool {
+	errs := multierr.Errors(err)
+	if len(errs) == 0 {
+		return errors.Is(err, defaultforwarderimpl.ErrPermanentHTTPError)
+	}
+	for _, e := range errs {
+		if !errors.Is(e, defaultforwarderimpl.ErrPermanentHTTPError) {
+			return false
+		}
+	}
+	return true
 }
 
 var _ source.Provider = (*SourceProviderFunc)(nil)
@@ -263,10 +295,12 @@ func (e *Exporter) ConsumeMetrics(ctx context.Context, ld pmetric.Metrics) error
 	consumer.addGatewayUsage(hostname, e.params, e.gatewayUsage, e.coatGWUsageMetric)
 	if err := consumer.Send(e.s); err != nil {
 		errFlush := fmt.Errorf("failed to flush metrics: %w", err)
-		if errors.Is(err, defaultforwarderimpl.ErrPermanentHTTPError) {
-			// 400/413/403 from the Datadog intake are permanent: retrying
-			// will not change the outcome. Signal exporterhelper to drop
-			// rather than queue and retry.
+		if allSendsPermanent(err) {
+			// All constituent send errors are permanent (400/413/403). Signal
+			// exporterhelper to drop rather than queue and retry.
+			// When consumer.Send combines permanent and transient errors (e.g.
+			// series→400 but sketches→503), we fall through so exporterhelper
+			// retries the transient failures.
 			return consumererror.NewPermanent(errFlush)
 		}
 		return errFlush

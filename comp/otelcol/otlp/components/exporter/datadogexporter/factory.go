@@ -272,7 +272,11 @@ func buildMetricsExporterConfig(cfg *datadogconfig.Config, shutdownFunc componen
 		Metrics:       serializerexporter.MetricsConfig{Metrics: cfg.Metrics},
 		TimeoutConfig: exporterhelper.TimeoutConfig{Timeout: httpCfg.Timeout},
 		HTTPConfig:    httpCfg,
-		RetryConfig:   cfg.BackOffConfig,
+		// Start from the legacy forwarder retry budget (2-64s / 15 min) so DDOT
+		// retries for as long as the async forwarder used to. Fields that differ
+		// from the OTel default are treated as explicit user overrides and take
+		// precedence; fields equal to the OTel default are assumed unconfigured.
+		RetryConfig: mergeRetryConfig(serializerexporter.DefaultAgentRetryConfig(), cfg.BackOffConfig),
 		// API carries the key and site so that when UseSyncForwarder is enabled
 		// the DDOT path can create its own serializer/forwarder rather than reusing
 		// the agent's shared serializer (which has an async forwarder).
@@ -281,6 +285,33 @@ func buildMetricsExporterConfig(cfg *datadogconfig.Config, shutdownFunc componen
 		QueueBatchConfig: cfg.QueueSettings,
 		ShutdownFunc:     shutdownFunc,
 	}
+}
+
+// mergeRetryConfig blends user-provided OTel retry settings onto legacy agent
+// defaults. Fields equal to the OTel defaults are treated as "not explicitly
+// configured" and the agent default is preserved; fields that differ from the
+// OTel default are treated as explicit user overrides.
+func mergeRetryConfig(base configretry.BackOffConfig, user configretry.BackOffConfig) configretry.BackOffConfig {
+	otel := configretry.NewDefaultBackOffConfig()
+	if user.Enabled != otel.Enabled {
+		base.Enabled = user.Enabled
+	}
+	if user.InitialInterval != otel.InitialInterval {
+		base.InitialInterval = user.InitialInterval
+	}
+	if user.RandomizationFactor != otel.RandomizationFactor {
+		base.RandomizationFactor = user.RandomizationFactor
+	}
+	if user.Multiplier != otel.Multiplier {
+		base.Multiplier = user.Multiplier
+	}
+	if user.MaxInterval != otel.MaxInterval {
+		base.MaxInterval = user.MaxInterval
+	}
+	if user.MaxElapsedTime != otel.MaxElapsedTime {
+		base.MaxElapsedTime = user.MaxElapsedTime
+	}
+	return base
 }
 
 // createLogsExporter creates a logs exporter based on the config.
