@@ -194,8 +194,14 @@ func NewConfigComponent(ctx context.Context, ddCfg string, uris []string) (confi
 		pkgconfig.Set("skip_ssl_validation", ddc.ClientConfig.TLS.InsecureSkipVerify, pkgconfigmodel.SourceFile)
 	}
 
-	// The otel-agent forces zlib compression, which is incompatible with the v3
-	// metrics intake.
+	// Compression: the otel-agent (DDOT) uses zstd for every signal (metrics, traces,
+	// logs) so the compression algorithm stays consistent across signals. The level
+	// defaults to 3 but stays overridable via DD_SERIALIZER_ZSTD_COMPRESSOR_LEVEL
+	// (SourceDefault < SourceEnvVar). DDOT deliberately stays on the v2 metrics intake:
+	// zstd is v3-compatible, but moving to v3 is a separate effort, so v3 is disabled
+	// here regardless of the compressor.
+	pkgconfig.Set("serializer_compressor_kind", pkgconfigsetup.DefaultCompressorKind, pkgconfigmodel.SourceDefault)
+	pkgconfig.Set("serializer_zstd_compressor_level", 3, pkgconfigmodel.SourceDefault)
 	pkgconfig.Set("use_v3_api.series.enabled", "false", pkgconfigmodel.SourceAgentRuntime)
 	pkgconfig.Set("serializer_experimental_use_v3_api.series.shadow_sample_rate", float64(0), pkgconfigmodel.SourceAgentRuntime)
 
@@ -205,7 +211,17 @@ func NewConfigComponent(ctx context.Context, ddCfg string, uris []string) (confi
 	pkgconfig.Set("logs_config.logs_dd_url", ddc.Logs.Endpoint, pkgconfigmodel.SourceFile)
 	pkgconfig.Set("logs_config.batch_wait", ddc.Logs.BatchWait, pkgconfigmodel.SourceFile)
 	pkgconfig.Set("logs_config.use_compression", ddc.Logs.UseCompression, pkgconfigmodel.SourceFile)
+	// logs_config.compression_level carries the exporter's logs::compression_level
+	// (a gzip level, 0-9). It only takes effect when the active log compressor is
+	// gzip; under the zstd default the level comes from logs_config.zstd_compression_level.
 	pkgconfig.Set("logs_config.compression_level", ddc.Logs.CompressionLevel, pkgconfigmodel.SourceFile)
+	// DDOT logs use zstd (matching metrics/traces) via logs_config.compression_kind's
+	// registered default. We intentionally do NOT pin compression_kind here: a
+	// SourceDefault set is a no-op for IsConfigured(), and pinning it higher would
+	// defeat the deliberate gzip fallback when logs_config.additional_endpoints is
+	// set (third-party endpoint compatibility). The zstd level defaults to 3 and is
+	// overridable via DD_LOGS_CONFIG_ZSTD_COMPRESSION_LEVEL.
+	pkgconfig.Set("logs_config.zstd_compression_level", 3, pkgconfigmodel.SourceDefault)
 
 	// APM & OTel trace configs
 	pkgconfig.Set("apm_config.enabled", true, pkgconfigmodel.SourceDefault)
