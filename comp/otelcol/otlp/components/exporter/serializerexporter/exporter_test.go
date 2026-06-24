@@ -1038,7 +1038,7 @@ func initSyncSerializerForTest(t testing.TB, logger *zap.Logger, cfg *ExporterCo
 			pkgconfig.Set("api_key", string(cfg.API.Key), pkgconfigmodel.SourceFile)
 			pkgconfig.Set("site", cfg.API.Site, pkgconfigmodel.SourceFile)
 			if cfg.Metrics.Metrics.TCPAddrConfig.Endpoint != "" {
-				pkgconfig.Set("dd_url", cfg.Metrics.Metrics.TCPAddrConfig.Endpoint, pkgconfigmodel.SourceDefault)
+				pkgconfig.Set("dd_url", cfg.Metrics.Metrics.TCPAddrConfig.Endpoint, pkgconfigmodel.SourceFile)
 			}
 			setupSerializer(pkgconfig, cfg)
 			setupForwarder(pkgconfig)
