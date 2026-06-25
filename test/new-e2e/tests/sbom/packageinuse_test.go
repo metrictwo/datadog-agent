@@ -67,11 +67,17 @@ const (
 )
 
 const (
-	// suidPackage owns a setuid-root binary, used to cover HasSetSuidBit == "true":
-	// `su` is `-rwsr-xr-x` in the ubi9 image and `su --version` execs it without
-	// invoking PAM, so the resolver records the setuid bit on the util-linux rpm.
-	// No other util-linux binary is run by the suite, so its (last-access-wins)
-	// SuidBit holds.
+	// activeControlPackage is continuously exercised by keepUbiActive (which runs
+	// `cat`, owned by coreutils-single). It is a positive control: if enrichment
+	// is flowing at all, this package reports a recent LastSeenRunning, so a "0" on
+	// gzip means "not in use" rather than "pipeline dead / value defaulted".
+	activeControlPackage = "coreutils-single"
+
+	// suidPackage owns the setuid-root `su` (-rwsr-xr-x), used to cover
+	// HasSetSuidBit == "true". The security probe also runs `cal` - a non-setuid
+	// binary of the SAME util-linux package - AFTER `su`, so asserting the package
+	// still reports HasSetSuidBit == "true" verifies the bit is sticky within a
+	// scan generation (a regression would flip it back to "false").
 	suidPackage = "util-linux"
 	// nonRootPackage is run only as the unprivileged `nobody` user, to cover
 	// RunningAsRoot == "false". grep is dropped to nobody via coreutils `chroot
@@ -230,7 +236,12 @@ func (s *packageInUseSuite) TestPackageInUse() {
 
 			ts, present, inUse := s.packageUsage(c, ubiRepo, inUsePackage)
 			require.Truef(c, present, "no enriched ubi9 SBOM yet (gzip carries no %s property)", propLastSeenRunning)
-			s.T().Logf("PKG-IN-USE baseline: gzip LastSeenRunning=%d; in-use components=%v", ts, inUse)
+			// Positive control: a package the keep-alive actually runs must be in
+			// use, proving enrichment is flowing - otherwise gzip=="0" below would
+			// also hold for a dead pipeline (the property now defaults to "0").
+			ctrlTS, _, _ := s.packageUsage(c, ubiRepo, activeControlPackage)
+			require.Positivef(c, ctrlTS, "positive control %s not in use - enrichment not flowing; gzip=0 cannot be trusted", activeControlPackage)
+			s.T().Logf("PKG-IN-USE baseline: gzip LastSeenRunning=%d; %s(control)=%d; in-use components=%v", ts, activeControlPackage, ctrlTS, inUse)
 			assert.Zerof(c, ts, "gzip should be not-in-use at baseline, got LastSeenRunning=%d", ts)
 			// 14m: the enrichment can only merge once the ubi9 overlayfs Trivy SBOM is
 			// ready in workloadmeta, which lands ~10-15m into the run.
@@ -240,6 +251,10 @@ func (s *packageInUseSuite) TestPackageInUse() {
 	// Phase 2: start a service that repeatedly runs gzip, and verify the package
 	// flips to in-use (a recent LastSeenRunning timestamp).
 	s.Run("in-use", func() {
+		// Node-clock instant just before the workload starts running gzip; the
+		// observed timestamp must be at or after this, proving it reflects a real
+		// access from this phase rather than a stale or coincidental value.
+		startedAt := s.nodeEpoch()
 		s.startInUseService()
 
 		s.EventuallyWithTf(func(collect *assert.CollectT) {
@@ -250,7 +265,8 @@ func (s *packageInUseSuite) TestPackageInUse() {
 			require.Truef(c, present, "gzip carries no %s property", propLastSeenRunning)
 			require.Positivef(c, ts, "gzip still reported not-in-use (LastSeenRunning=0); in-use components=%v", inUse)
 			age := time.Now().Unix() - ts
-			s.T().Logf("PKG-IN-USE running: gzip LastSeenRunning=%d age=%ds; in-use components=%v", ts, age, inUse)
+			s.T().Logf("PKG-IN-USE running: gzip LastSeenRunning=%d age=%ds startedAt=%d; in-use components=%v", ts, age, startedAt, inUse)
+			assert.GreaterOrEqualf(c, ts, startedAt, "gzip LastSeenRunning %d predates the service start %d (stale/coincidental value)", ts, startedAt)
 			assert.LessOrEqualf(c, age, inUseWindowSec, "gzip LastSeenRunning is %ds old, expected <= %ds while in use", age, inUseWindowSec)
 			// The workload runs as root and gzip is not a setuid binary, so the
 			// security enrichment must reflect that on the in-use component.
@@ -301,10 +317,21 @@ func (s *packageInUseSuite) TestPackageInUse() {
 			rootVal := s.packageProperty(ubiRepo, nonRootPackage, propRunningAsRoot)
 			s.T().Logf("PKG-IN-USE security: %s HasSetSuidBit=%q (ts=%d), %s RunningAsRoot=%q (ts=%d)", suidPackage, suidVal, suidTS, nonRootPackage, rootVal, nrTS)
 
-			assert.Equalf(c, "true", suidVal, "%s HasSetSuidBit should be true (su is setuid root)", suidPackage)
+			assert.Equalf(c, "true", suidVal, "%s HasSetSuidBit should be true and stay sticky after the non-setuid cal of the same package ran", suidPackage)
 			assert.Equalf(c, "false", rootVal, "%s RunningAsRoot should be false (run only as nobody)", nonRootPackage)
 		}, 5*time.Minute, 15*time.Second, "ubi9 SBOM never reported the expected security properties")
 	})
+
+	// NOTE: a "refresh reset" phase (write the package DB to fire the bundled
+	// need_refresh_sbom / refresh_sbom rules, then expect LastSeenRunning to
+	// return to "0") is not asserted: it does not work end to end. A diagnostic
+	// run with system-probe debug logging showed no "Refreshing SBOM" log after
+	// writing under /var/lib/rpm in the container - the bundled refresh rules
+	// never fire on the write, so RefreshSBOM is never called and no re-scan
+	// happens (initial scan and forwarding are healthy). Enrichment is driven by
+	// exec events, but the refresh depends on the rule engine seeing the open
+	// event, which it does not here. Root-causing the non-firing rule is CWS
+	// work, not this test. Re-add once a package-DB write triggers a refresh.
 }
 
 // packageUsage returns, across every successful ubi9 container-image SBOM payload
@@ -407,17 +434,20 @@ func (s *packageInUseSuite) stopInUseService() {
 }
 
 // startSecurityProbes launches, inside the ubi9 workload pod, a detached loop
-// that exercises the two security properties the gzip phases leave uncovered:
-//   - `su --version` execs the setuid-root `su` binary (util-linux) as root, so
-//     the resolver records HasSetSuidBit on util-linux;
+// that exercises the security properties the gzip phases leave uncovered:
+//   - `su --version` execs the setuid-root `su` (util-linux) as root, so the
+//     resolver records HasSetSuidBit on util-linux;
+//   - `cal` then execs a NON-setuid binary of the SAME util-linux package, so a
+//     correct (sticky) resolver keeps HasSetSuidBit true rather than clearing it;
 //   - grep is run as the unprivileged `nobody` user via coreutils `chroot
 //     --userspec`, so grep's RunningAsRoot stays false.
 //
-// chroot (coreutils) - not util-linux's setpriv/runuser - drops privileges so the
-// only util-linux binary the suite runs is the setuid `su`, keeping its bit set.
+// chroot (coreutils, not util-linux's setpriv/runuser) drops privileges so the
+// only util-linux binaries the suite runs are `su` and `cal`.
 func (s *packageInUseSuite) startSecurityProbes() {
 	script := `nohup sh -c 'echo $$ > /tmp/secprobe.pid; while true; do ` +
 		`su --version >/dev/null 2>&1; ` +
+		`cal >/dev/null 2>&1; ` +
 		`/usr/sbin/chroot --userspec=nobody:nobody / /usr/bin/grep --version >/dev/null 2>&1; ` +
 		`sleep 15; done' </dev/null >/dev/null 2>&1 &`
 	stdout, stderr := s.podExec("sh", "-c", script)
@@ -428,6 +458,14 @@ func (s *packageInUseSuite) startSecurityProbes() {
 func (s *packageInUseSuite) stopSecurityProbes() {
 	stdout, stderr := s.podExec("sh", "-c", `kill "$(cat /tmp/secprobe.pid)" 2>/dev/null; rm -f /tmp/secprobe.pid; echo stopped`)
 	s.T().Logf("PKG-IN-USE stop security probes: stdout=%q stderr=%q", stdout, stderr)
+}
+
+// nodeEpoch returns the workload node's wall clock (Unix seconds), read from the
+// pod so it shares the clock that stamps LastSeenRunning.
+func (s *packageInUseSuite) nodeEpoch() int64 {
+	stdout, _ := s.podExec("date", "+%s")
+	n, _ := strconv.ParseInt(strings.TrimSpace(stdout), 10, 64)
+	return n
 }
 
 // podExec runs cmd in the ubi9 workload pod's container and returns stdout/stderr.
