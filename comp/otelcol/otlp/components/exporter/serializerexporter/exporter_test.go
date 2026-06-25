@@ -1019,6 +1019,35 @@ func TestDefaultForwarder_SwallowsErrors(t *testing.T) {
 	require.NoError(t, mc.ConsumeMetrics(context.Background(), makeGaugeMetrics(50)))
 }
 
+// TestOSSSyncForwarder_PropagatesErrors verifies that the OSS Datadog exporter
+// path (NewFactoryForOSSExporter, f.s == nil) also uses OTelSyncForwarder when
+// the UseSyncForwarder gate is on, and propagates intake errors back to the caller.
+func TestOSSSyncForwarder_PropagatesErrors(t *testing.T) {
+	restore := setSyncForwarderGate(t, true)
+	defer restore()
+
+	intake := newFakeIntake(http.StatusInternalServerError)
+	defer intake.Close()
+
+	cfg := benchExporterConfig(t, intake.URL)
+	f := NewFactoryForOSSExporter(component.MustNewType("datadog"), nil)
+	exp, err := f.CreateMetrics(
+		context.Background(),
+		exportertest.NewNopSettings(component.MustNewType("datadog")),
+		cfg,
+	)
+	require.NoError(t, err)
+	require.NoError(t, exp.Start(context.Background(), componenttest.NewNopHost()))
+	defer func() { _ = exp.Shutdown(context.Background()) }()
+
+	mc, ok := exp.(metricsConsumer)
+	require.True(t, ok)
+
+	err = mc.ConsumeMetrics(context.Background(), makeGaugeMetrics(50))
+	require.Error(t, err, "5xx from intake must surface back through ConsumeMetrics on the OSS exporter path")
+	require.GreaterOrEqual(t, intake.requests.Load(), int64(1), "intake should have received at least one request")
+}
+
 // initSyncSerializerForTest creates a serializer backed by OTelSyncForwarder
 // via a mini-Fx app. This simulates the DDOT production path where
 // cmd/otel-agent/subcommands/run/command.go injects OTelSyncForwarder into the

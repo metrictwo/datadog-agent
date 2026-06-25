@@ -8,6 +8,7 @@ package serializerexporter
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/DataDog/datadog-agent/comp/core/config"
@@ -24,9 +25,11 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/config/create"
 	pkgconfigmodel "github.com/DataDog/datadog-agent/pkg/config/model"
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
+	configutils "github.com/DataDog/datadog-agent/pkg/config/utils"
 	"github.com/DataDog/datadog-agent/pkg/serializer"
 	"github.com/DataDog/datadog-agent/pkg/util/compression"
 	"github.com/DataDog/datadog-agent/pkg/util/fxutil"
+	utilhttp "github.com/DataDog/datadog-agent/pkg/util/http"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/datadog"
 	"go.uber.org/fx"
@@ -121,27 +124,28 @@ func setupSerializer(config pkgconfigmodel.Config, cfg *ExporterConfig) {
 	config.Set("proxy.no_proxy", noProxy, pkgconfigmodel.SourceAgentRuntime)
 }
 
-// stoppableForwarder is the minimum surface InitSerializer's callers need to
-// drive the forwarder lifecycle.
-type stoppableForwarder interface {
+// ForwarderLifecycle is the minimum interface needed to manage a forwarder's
+// lifecycle. Returned by InitSerializer so callers do not need to depend on the
+// concrete forwarder type, which varies with the UseSyncForwarder feature gate.
+type ForwarderLifecycle interface {
 	Start() error
 	Stop()
 }
 
-// InitSerializer initializes the serializer and the DefaultForwarder behind
-// it. Should only be used in the OSS Datadog exporter or in tests.
-func InitSerializer(logger *zap.Logger, cfg *ExporterConfig, sourceProvider source.Provider) (*serializer.Serializer, *defaultforwarderimpl.DefaultForwarder, error) {
-	s, fw, err := initSerializerInternal(logger, cfg, sourceProvider)
-	if err != nil {
-		return nil, nil, err
-	}
-	def, _ := fw.(*defaultforwarderimpl.DefaultForwarder)
-	return s, def, nil
+// stoppableForwarder is an internal alias for ForwarderLifecycle.
+type stoppableForwarder = ForwarderLifecycle
+
+// InitSerializer initializes the serializer and the forwarder behind it.
+// Should only be used in the OSS Datadog exporter or in tests.
+func InitSerializer(logger *zap.Logger, cfg *ExporterConfig, sourceProvider source.Provider) (*serializer.Serializer, ForwarderLifecycle, error) {
+	return initSerializerInternal(logger, cfg, sourceProvider)
 }
 
-// initSerializerInternal builds the serializer and a DefaultForwarder.
-// Used only by the OSS Datadog exporter. DDOT injects its forwarder directly
-// through the Fx graph in cmd/otel-agent/subcommands/run/command.go.
+// initSerializerInternal builds the serializer and a forwarder.
+// When the UseSyncForwarder feature gate is enabled it creates an OTelSyncForwarder;
+// otherwise it creates a DefaultForwarder. Used only by the OSS Datadog exporter.
+// DDOT injects its forwarder directly through the Fx graph in
+// cmd/otel-agent/subcommands/run/command.go.
 func initSerializerInternal(logger *zap.Logger, cfg *ExporterConfig, sourceProvider source.Provider) (*serializer.Serializer, stoppableForwarder, error) {
 	var f defaultforwarder.Forwarder
 	var s *serializer.Serializer
@@ -198,24 +202,44 @@ func initSerializerInternal(logger *zap.Logger, cfg *ExporterConfig, sourceProvi
 		fx.Populate(&s),
 	}
 
-	opts = append(opts,
-		// casts the defaultforwarder.Component to a defaultforwarder.Forwarder
-		fx.Provide(func(c defaultforwarder.Component) (defaultforwarder.Forwarder, error) {
-			return defaultforwarder.Forwarder(c), nil
-		}),
-		defaultforwarderfx.Module(defaultforwarder.NewParams()),
-	)
+	if IsSyncForwarderEnabled() {
+		opts = append(opts,
+			fx.Provide(func(c config.Component, l logdef.Component, sec secrets.Component) (defaultforwarder.Forwarder, error) {
+				eds, err := configutils.GetMultipleEndpoints(c)
+				if err != nil {
+					return nil, err
+				}
+				timeout := cfg.HTTPConfig.Timeout
+				if timeout == 0 {
+					timeout = legacyForwarderTimeout
+				}
+				httpClient := &http.Client{
+					Timeout:   timeout,
+					Transport: utilhttp.CreateHTTPTransport(c),
+				}
+				return defaultforwarderimpl.NewOTelSyncForwarder(c, l, sec, eds, httpClient)
+			}),
+		)
+	} else {
+		opts = append(opts,
+			// casts the defaultforwarder.Component to a defaultforwarder.Forwarder
+			fx.Provide(func(c defaultforwarder.Component) (defaultforwarder.Forwarder, error) {
+				return defaultforwarder.Forwarder(c), nil
+			}),
+			defaultforwarderfx.Module(defaultforwarder.NewParams()),
+		)
+	}
 
 	app := fx.New(opts...)
 	if err := app.Err(); err != nil {
 		return nil, nil, err
 	}
 
-	fw, ok := f.(*defaultforwarderimpl.DefaultForwarder)
+	sf, ok := f.(stoppableForwarder)
 	if !ok {
-		return nil, nil, errors.New("failed to cast forwarder to *defaultforwarderimpl.DefaultForwarder")
+		return nil, nil, errors.New("forwarder does not implement Start/Stop lifecycle")
 	}
-	return s, fw, nil
+	return s, sf, nil
 }
 
 type orchestratorinterfaceimpl struct {
