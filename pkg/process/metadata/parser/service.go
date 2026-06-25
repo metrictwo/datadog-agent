@@ -136,15 +136,14 @@ func (d *ServiceExtractor) ExtractSingle(proc *procutil.Process) {
 		// check the service metadata is for the same process
 		if len(proc.Cmdline) == len(meta.cmdline) {
 			if len(proc.Cmdline) == 0 || proc.Cmdline[0] == meta.cmdline[0] {
+				log.Infof("process %d already extracted", proc.Pid)
 				return
 			}
 		}
 	}
 	meta := d.extractServiceMetadata(proc)
 	if meta != nil {
-		if log.ShouldLog(log.TraceLvl) {
-			log.Tracef("detected service metadata: %v", meta)
-		}
+		log.Infof("detected service metadata %d: %v", proc.Pid, meta)
 		d.serviceByPID[proc.Pid] = meta
 	}
 }
@@ -176,9 +175,7 @@ func (d *ServiceExtractor) GetServiceContext(pid int32) []string {
 
 		// Service tag was found from the SCM, return it.
 		if len(tags) > 0 {
-			if log.ShouldLog(log.TraceLvl) {
-				log.Tracef("Found process_context from SCM for pid:%v service tags:%v", pid, tags)
-			}
+			log.Infof("Found process_context from SCM for pid:%v service tags:%v", pid, tags)
 			return tags
 		}
 	}
@@ -190,6 +187,7 @@ func (d *ServiceExtractor) GetServiceContext(pid int32) []string {
 }
 
 func (d *ServiceExtractor) extractServiceMetadata(process *procutil.Process) *serviceMetadata {
+	log.Infof("extracting service metadata from %+v", process)
 	cmd := process.Cmdline
 	if len(cmd) == 0 || len(cmd[0]) == 0 {
 		return nil

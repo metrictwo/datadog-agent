@@ -7,6 +7,8 @@ package sender
 
 import (
 	"net/netip"
+
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // listenKey identifies a listening socket by its bind IP and port. Two distinct
@@ -70,6 +72,7 @@ func (r *serviceResolver) Resolve(pid int32, remoteIP netip.Addr, remotePort, lo
 	// Try IIS tags first (Windows only, nil on Linux)
 	if r.GetIISTags != nil {
 		if iisTags := r.GetIISTags(remotePort, localPort); len(iisTags) > 0 {
+			log.Infof("iis tags: %v", iisTags)
 			remoteTags = append(remoteTags, iisTags...)
 		}
 	}
@@ -81,10 +84,13 @@ func (r *serviceResolver) Resolve(pid int32, remoteIP netip.Addr, remotePort, lo
 			return nil
 		}
 		if r.GetServiceContext != nil {
-			remoteTags = append(remoteTags, r.GetServiceContext(destPID)...)
+			ctxTags := r.GetServiceContext(destPID)
+			log.Infof("ctx tags: %v", ctxTags)
+			remoteTags = append(remoteTags, ctxTags...)
 		}
 		if r.GetProcessTags != nil {
 			if pidTags := r.GetProcessTags(destPID); len(pidTags) > 0 {
+				log.Infof("pid tags: %v", pidTags)
 				remoteTags = append(remoteTags, pidTags...)
 			}
 		}
