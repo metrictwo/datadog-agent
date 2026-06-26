@@ -141,6 +141,12 @@ agents:
         # container SBOMs were ready).
         - name: DD_RUNTIME_SECURITY_CONFIG_SBOM_FORWARD_INTERVAL
           value: "30s"
+        # DIAGNOSTIC (temporary): debug logging so the SBOM-resolver refresh
+        # lines (Refreshing SBOM / analyzing sbom / Forwarding SBOM) are emitted.
+        - name: DD_LOG_LEVEL
+          value: "debug"
+        - name: DD_SYSTEM_PROBE_CONFIG_LOG_LEVEL
+          value: "debug"
   volumeMounts:
     - name: trivycache
       mountPath: /root/.cache/trivy
@@ -322,16 +328,35 @@ func (s *packageInUseSuite) TestPackageInUse() {
 		}, 5*time.Minute, 15*time.Second, "ubi9 SBOM never reported the expected security properties")
 	})
 
-	// NOTE: a "refresh reset" phase (write the package DB to fire the bundled
-	// need_refresh_sbom / refresh_sbom rules, then expect LastSeenRunning to
-	// return to "0") is not asserted: it does not work end to end. A diagnostic
-	// run with system-probe debug logging showed no "Refreshing SBOM" log after
-	// writing under /var/lib/rpm in the container - the bundled refresh rules
-	// never fire on the write, so RefreshSBOM is never called and no re-scan
-	// happens (initial scan and forwarding are healthy). Enrichment is driven by
-	// exec events, but the refresh depends on the rule engine seeing the open
-	// event, which it does not here. Root-causing the non-firing rule is CWS
-	// work, not this test. Re-add once a package-DB write triggers a refresh.
+	// DIAGNOSTIC (temporary): the bundled refresh rules never fired on a
+	// touch-created /var/lib/rpm dotfile (no "Refreshing SBOM" log). Test whether
+	// O_CREAT path non-resolution is the cause: write the package DB three ways
+	// and dump the SBOM-resolver log after each, watching the Refreshing-SBOM
+	// count. A = new file (O_CREAT), B = existing file (append), C = real DB file.
+	// Always passes.
+	s.Run("refresh-diagnostic", func() {
+		out, _ := s.podExec("sh", "-c", "ls -la /var/lib/rpm/ 2>&1 | head -40")
+		s.T().Logf("PKG-IN-USE rpmdir:\n%s", out)
+		s.dumpSystemProbeSBOMLogs("baseline")
+
+		o, e := s.podExec("touch", "/var/lib/rpm/.sbom-probe")
+		s.T().Logf("PKG-IN-USE triggerA touch-new: out=%q err=%q", o, e)
+		time.Sleep(30 * time.Second)
+		s.dumpSystemProbeSBOMLogs("after-A-touch-new")
+
+		o, e = s.podExec("sh", "-c", "echo probe >> /var/lib/rpm/.sbom-probe")
+		s.T().Logf("PKG-IN-USE triggerB append-existing: out=%q err=%q", o, e)
+		time.Sleep(30 * time.Second)
+		s.dumpSystemProbeSBOMLogs("after-B-append-existing")
+
+		o, e = s.podExec("sh", "-c", `for f in /var/lib/rpm/rpmdb.sqlite /var/lib/rpm/Packages /var/lib/rpm/Packages.db; do [ -f "$f" ] && dd if=/dev/null of="$f" conv=notrunc bs=1 count=0 2>&1 && echo "wrote $f"; done`)
+		s.T().Logf("PKG-IN-USE triggerC db-write: out=%q err=%q", o, e)
+		time.Sleep(30 * time.Second)
+		s.dumpSystemProbeSBOMLogs("after-C-db-write")
+
+		v := s.packageProperty(ubiRepo, inUsePackage, propLastSeenRunning)
+		s.T().Logf("PKG-IN-USE refresh-diagnostic final: gzip LastSeenRunning=%q", v)
+	})
 }
 
 // packageUsage returns, across every successful ubi9 container-image SBOM payload
@@ -458,6 +483,26 @@ func (s *packageInUseSuite) startSecurityProbes() {
 func (s *packageInUseSuite) stopSecurityProbes() {
 	stdout, stderr := s.podExec("sh", "-c", `kill "$(cat /tmp/secprobe.pid)" 2>/dev/null; rm -f /tmp/secprobe.pid; echo stopped`)
 	s.T().Logf("PKG-IN-USE stop security probes: stdout=%q stderr=%q", stdout, stderr)
+}
+
+// dumpSystemProbeSBOMLogs prints the count of "Refreshing SBOM" entries and the
+// recent SBOM-resolver lines from the system-probe log (read via the agent
+// container, which shares the /var/log/datadog volume). Watching the count
+// across tagged dumps shows which package-DB write fires a refresh. DIAGNOSTIC.
+func (s *packageInUseSuite) dumpSystemProbeSBOMLogs(tag string) {
+	pods, err := s.Env().KubernetesCluster.Client().CoreV1().Pods("datadog").List(context.Background(), metav1.ListOptions{
+		LabelSelector: fields.OneTermEqualSelector("app", s.Env().Agent.LinuxNodeAgent.LabelSelectors["app"]).String(),
+	})
+	if err != nil || len(pods.Items) == 0 {
+		s.T().Logf("DIAG[sysprobe-sbom-log %s] could not list agent pods: %v", tag, err)
+		return
+	}
+	script := `L=/var/log/datadog/system-probe.log; ` +
+		`echo "Refreshing-SBOM count: $(grep -c "Refreshing SBOM" "$L" 2>/dev/null)"; ` +
+		`echo "--- recent Refreshing SBOM ---"; grep "Refreshing SBOM" "$L" 2>/dev/null | tail -8; ` +
+		`echo "--- recent SBOM chain ---"; grep -hiE "Refreshing SBOM|analyzing sbom|new sbom generated|Forwarding SBOM" "$L" 2>/dev/null | tail -25`
+	stdout, stderr, err := s.Env().KubernetesCluster.KubernetesClient.PodExec("datadog", pods.Items[0].Name, "agent", []string{"sh", "-c", script})
+	s.T().Logf("DIAG[sysprobe-sbom-log %s] err=%v\n%s\n%s", tag, err, stdout, stderr)
 }
 
 // nodeEpoch returns the workload node's wall clock (Unix seconds), read from the
