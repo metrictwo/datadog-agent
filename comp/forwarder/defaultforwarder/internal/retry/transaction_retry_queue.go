@@ -219,8 +219,17 @@ func (tc *TransactionRetryQueue) FlushToDisk() error {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
 
-	transactions := tc.extractTransactionsFromMemory(tc.maxMemSizeInBytes)
-	return tc.optionalStorage.Store(transactions)
+	// Loop until all transaction are serialized to disk, or until we face an
+	// error, which means there is no point to proceed.
+	for len(tc.transactions) > 0 {
+		transactions := tc.extractTransactionsFromMemory(tc.maxMemSizeInBytes)
+
+		if err := tc.optionalStorage.Store(transactions); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (tc *TransactionRetryQueue) extractTransactionsForDisk(payloadSize int) [][]transaction.Transaction {
